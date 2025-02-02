@@ -11,7 +11,9 @@ section .data
 		msg_failed_socket db "failed to create socket", 10
 		msg_failed_bind db "failed to bind socket", 10
 		msg_failed_listen db "failed to listen", 10
-		msg_server_started db "server started on port ", 0
+		msg_server_started db "reverse proxy listening on port ", 0
+
+		msg_failed_accept db "failed to accept connection", 10
 
 		;; utils
 		newline db 10, 0
@@ -21,6 +23,10 @@ section .bss ; BLOCK STARTED BY SYMBOL -> used for uninitialized data
 	;; Reduces executable size by avoiding pre-filled zeros
   sockfd resq 1       ; Reserve space for socket file descriptor
   server_addr resb 16 ; Reserve space for sockaddr_in struct
+	client_addr resb 16         ; Reserve space for client sockaddr_in struct
+  client_addr_len resd 1      ; Reserve space for client address length
+  client_fd resq 1            ; Reserve space for client file descriptor
+
 
 
 section .text
@@ -67,7 +73,7 @@ process_args:
 
 		syscall
 
-		test rax, rax
+		test rax, rax ;; Performs a bitwise AND but only sets flags, doesn't store result. this is a common way to check if a value is 0
 		js socket_failed 
 
 		mov [sockfd], rax   ; Save socket file descriptor
@@ -86,7 +92,7 @@ process_args:
 
 		;; bind socket
 		mov rdi, [sockfd]
-		lea rsi, [server_addr]
+		lea rsi, [server_addr] ;; (Load Effective Address) - Calculates an address and puts it in the destination
 		mov edx, 16 ;; sizeof(struct sockaddr_in)
 		mov rax, 49 ;; bind() syscall
 
@@ -115,7 +121,26 @@ process_args:
 
     mov rdi, 0         ; exit status 0
     mov rax, 60        ; syscall: exit
-    syscall
+    
+		jmp server_loop
+
+server_loop:
+	;; accepting incoming connections 
+	mov dword [client_addr_len], 16 ;; sizeof(struct sockaddr_in)
+	mov rdi, [sockfd] 
+	lea rsi, [client_addr]
+	lea rdx, [client_addr_len]
+	mov rax, 43 ;; accept() syscall
+	syscall 
+
+
+	test rax, rax
+	js accept_failed
+
+  mov [client_fd], rax  ; store the new client socket descriptor
+
+  jmp server_loop       ; forever running
+
 
 ;; socket failed
 socket_failed:
@@ -133,6 +158,12 @@ bind_failed:
 listen_failed:
 		mov rdi, 1
 		mov rsi, msg_failed_listen
+		call print_string
+		jmp exit_error
+
+accept_failed:
+		mov rdi, 1
+		mov rsi, msg_failed_accept
 		call print_string
 		jmp exit_error
 
@@ -205,7 +236,7 @@ convert_loop:
     
 print_digits:
     test rcx, rcx       ; Check if we have digits to print
-    jz print_done
+    jz print_done				; Jumps to specified label if the zero flag is set
     
     pop rdi             ; Get digit
     push rcx            ; Save counter
