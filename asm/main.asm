@@ -17,6 +17,7 @@ section .data
 		msg_backend_connect_failed_cleanup db "failed to connect to backend", 10
     msg_client_connected db "Client connected", 10
     msg_data_received db "Received data from client. Bytes: ", 0
+		msg_client_disconnected db "Client disconnected", 10
 
 		;; utils
 		newline db 10, 0
@@ -87,7 +88,9 @@ process_args:
     call atoi
     mov r9, rax         ; Store backend_port in r9
 
-		mov r10, [rsp+24]   ; Store backend_host pointer in r10
+    mov rax, [rsp+24]   ; Get pointer to backend_host
+    mov [backend_host_ptr], rax ; Save in memory
+
 
 		;; SOCKET CREATION
 		mov rdi, AF_INET ;; AF_INET (IPv4)
@@ -168,7 +171,9 @@ server_loop:
 	syscall
 
 	test rax, rax
-	jle recv_failed    ; Changed to jle to catch both 0 and negative
+	jl recv_failed    ; Changed to jle to catch both 0 and negative
+	jz  client_closed    ; Handle normal closure (rax == 0)
+
 
 	push rax           ; Save bytes received for later
 	mov rdi, 1
@@ -183,7 +188,7 @@ server_loop:
 	call print_string
 
 	; Parse backend IP (127.0.0.1)
-	mov rdi, r10        ; backend_host from stored pointer
+	mov rdi, [backend_host_ptr]        ; backend_host from stored pointer
 	call parse_ip
 	test rax, rax
 	js backend_connect_failed
@@ -248,13 +253,25 @@ relay_loop:
 
     jmp relay_loop
 
+client_closed:
+    ; Log closure if desired
+    mov rdi, 1
+    mov rsi, msg_client_disconnected  ; You might want to add this message
+    call print_string
+    jmp close_connections
+
 close_connections:
+    ; Close backend socket
     mov rdi, [backend_fd]
-    mov rax, 3
+    mov rax, 3          ; close() syscall
     syscall
+    
+    ; Close client socket
     mov rdi, [client_fd]
     mov rax, 3
     syscall
+    
+    ; Return to server loop
     jmp server_loop
 
 ;; socket failed
