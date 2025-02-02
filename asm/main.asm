@@ -14,9 +14,16 @@ section .data
 		msg_server_started db "reverse proxy listening on port ", 0
 
 		msg_failed_accept db "failed to accept connection", 10
+		msg_failed_recv db "failed to receive data", 10
+		msg_backend_connect_failed db "failed to connect to backend", 10
 
 		;; utils
 		newline db 10, 0
+
+		;; constants
+    AF_INET equ 2
+    IP_ADDR_LEN equ 4
+
 
 section .bss ; BLOCK STARTED BY SYMBOL -> used for uninitialized data
 	;; Memory is allocated at runtime, not stored in the binary
@@ -26,12 +33,20 @@ section .bss ; BLOCK STARTED BY SYMBOL -> used for uninitialized data
 	client_addr resb 16         ; Reserve space for client sockaddr_in struct
   client_addr_len resd 1      ; Reserve space for client address length
   client_fd resq 1            ; Reserve space for client file descriptor
+  backend_fd resq 1           ; Reserve space for backend file descriptor
+	buffer resb 4096  ; Reserve 4096 bytes for the buffer
+	backend_addr resb 16  ; Reserve 16 bytes for the backend sockaddr_in structure
 
+  hostent_struct resb 32       ; Hostent structure
+  h_addr_list resq 2           ; Address list
+  ip_addr resd 1              ; IP address storage
+  temp_buffer resb 16         ; Temporary buffer for parsing
 
 
 section .text
     global _start       ; entry point for the linker
-		extern htons
+		global htons
+		extern gethostbyname
 
 _start:
     mov rax, [rsp]      ; rax == argc ; rsp == argv
@@ -133,11 +148,32 @@ server_loop:
 	mov rax, 43 ;; accept() syscall
 	syscall 
 
-
 	test rax, rax
 	js accept_failed
 
   mov [client_fd], rax  ; store the new client socket descriptor
+
+	;; recieve data from the client
+	lea rdi, [buffer]
+	mov rsi, [client_fd]
+	mov rdx, 4096
+	mov rax, 45 ;; recv() syscall
+	syscall
+
+	test rax, rax
+	js recv_failed
+
+	;; connecting to the backend server
+  lea rdi, [rcx]          ; Use the backend_host argument passed (backend_host is in rcx)
+  call gethostbyname
+
+  test rax, rax
+  js backend_connect_failed
+
+	xor rax, rax
+  mov [backend_fd], rax  ; store the backend socket descriptor
+  mov word [backend_addr], 2 ; sin_family = AF_INET
+  mov dword [backend_addr+4], eax ; backend IP (this will come from gethostbyname)
 
   jmp server_loop       ; forever running
 
@@ -148,6 +184,18 @@ socket_failed:
     mov rsi, msg_failed_socket
     call print_string
     jmp exit_error
+
+recv_failed:
+		mov rdi, 1
+		mov rsi, msg_failed_recv
+		call print_string
+		jmp exit_error
+
+backend_connect_failed:
+		mov rdi, 1
+		mov rsi, msg_backend_connect_failed
+		call print_string
+		jmp exit_error
 
 bind_failed:
 		mov rdi, 1
@@ -253,6 +301,87 @@ print_digits:
     jmp print_digits
     
 print_done:
+    mov rsp, rbp
+    pop rbp
+    ret
+
+htons:
+    mov ax, di        ; Load the 16-bit value from rdi into ax
+    xchg al, ah       ; Swap the lower and upper bytes
+    ret
+
+gethostbyname:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    
+    mov r12, rdi                ; Save input string
+    xor r13, r13                ; Current number
+    xor r14, r14                ; Byte count
+    
+.parse_ip:
+    movzx rax, byte [r12]
+    test al, al
+    jz .finish_byte
+    
+    cmp al, '.'
+    je .finish_byte
+    
+    sub al, '0'
+    cmp al, 9
+    ja .invalid
+    
+    imul r13, r13, 10
+    add r13, rax
+    
+    cmp r13, 255
+    ja .invalid
+    
+    inc r12
+    jmp .parse_ip
+    
+.finish_byte:
+    mov [ip_addr + r14], r13b
+    inc r14
+    
+    cmp r14, 4
+    je .build_hostent
+    
+    test al, al
+    jz .invalid
+    
+    inc r12
+    xor r13, r13
+    jmp .parse_ip
+    
+.build_hostent:
+    lea rax, [hostent_struct]
+    
+    mov dword [rax], 0
+    mov qword [rax + 8], 0
+    mov dword [rax + 16], AF_INET
+    mov dword [rax + 20], IP_ADDR_LEN
+    
+    lea rbx, [h_addr_list]
+    mov [rax + 24], rbx
+    
+    mov ebx, [ip_addr]
+    mov [h_addr_list], rbx
+    mov qword [h_addr_list + 8], 0
+    
+    jmp .done
+    
+.invalid:
+    xor rax, rax
+    
+.done:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
     mov rsp, rbp
     pop rbp
     ret
