@@ -1,3 +1,4 @@
+term 1
 nasm -f elf64 -o main.out asm/main.asm
 ld main.out -o main
 ./main 1234 localhost 8080
