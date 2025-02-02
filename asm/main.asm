@@ -39,6 +39,8 @@ section .bss ; BLOCK STARTED BY SYMBOL -> used for uninitialized data
 	backend_addr resb 16  ; Reserve 16 bytes for the backend sockaddr_in structure
 	backend_buffer resb 4096 ; Reserve 4096 bytes for the backend buffer
 
+	backend_host_ptr resq 1  
+
   hostent_struct resb 32       ; Hostent structure
   h_addr_list resq 2           ; Address list
   ip_addr resd 1              ; IP address storage
