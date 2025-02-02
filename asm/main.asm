@@ -1,5 +1,3 @@
-; main.asm
-
 section .data
     msg_three_arguments_rec db "there are 3 arguments, move on", 10 ; 10 is the newline
     msg_failed_to_get_three_arguments db "usage: ./main <listen_port> <backend_host> <backend_port>", 10
@@ -16,6 +14,9 @@ section .data
 		msg_failed_accept db "failed to accept connection", 10
 		msg_failed_recv db "failed to receive data", 10
 		msg_backend_connect_failed db "failed to connect to backend", 10
+		msg_backend_connect_failed_cleanup db "failed to connect to backend", 10
+    msg_client_connected db "Client connected", 10
+    msg_data_received db "Received data from client. Bytes: ", 0
 
 		;; utils
 		newline db 10, 0
@@ -36,17 +37,21 @@ section .bss ; BLOCK STARTED BY SYMBOL -> used for uninitialized data
   backend_fd resq 1           ; Reserve space for backend file descriptor
 	buffer resb 4096  ; Reserve 4096 bytes for the buffer
 	backend_addr resb 16  ; Reserve 16 bytes for the backend sockaddr_in structure
+	backend_buffer resb 4096 ; Reserve 4096 bytes for the backend buffer
 
   hostent_struct resb 32       ; Hostent structure
   h_addr_list resq 2           ; Address list
   ip_addr resd 1              ; IP address storage
   temp_buffer resb 16         ; Temporary buffer for parsing
 
+	;; declaring constants
+	AF_INET equ 2
+	SOCK_STREAM equ 1
+	IP_ADDR_LEN equ 4
 
 section .text
     global _start       ; entry point for the linker
 		global htons
-		extern gethostbyname
 
 _start:
     mov rax, [rsp]      ; rax == argc ; rsp == argv
@@ -80,24 +85,23 @@ process_args:
     call atoi
     mov r9, rax         ; Store backend_port in r9
 
-		;; SOCKET CREATION
-		mov rdi, 2 ;; AF_INET (IPv4)
-		mov rsi, 1 ;; SOCK_STREAM
-		mov rdx, 0 ;; protocol
-		mov rax, 41 ;; socket() syscall
+		mov r10, [rsp+24]   ; Store backend_host pointer in r10
 
+		;; SOCKET CREATION
+		mov rdi, AF_INET ;; AF_INET (IPv4)
+		mov rsi, SOCK_STREAM ;; SOCK_STREAM
+		xor rdx, rdx ;; protocol
+		mov rax, 41 ;; socket() syscall
 		syscall
 
 		test rax, rax ;; Performs a bitwise AND but only sets flags, doesn't store result. this is a common way to check if a value is 0
 		js socket_failed 
-
 		mov [sockfd], rax   ; Save socket file descriptor
 
 		;; prepare sockaddr_in struct
 		xor rax, rax
 		mov [server_addr], rax
 		mov [server_addr+8], rax
-
 		mov word [server_addr], 2 ; sin_family = AF_INET
 		mov dword [server_addr+4], 0 ; sin_addr.sin_addr = INADDR_ANY
 
@@ -134,49 +138,122 @@ process_args:
     mov rsi, newline
     call print_string
 
-    mov rdi, 0         ; exit status 0
-    mov rax, 60        ; syscall: exit
-    
-		jmp server_loop
-
 server_loop:
 	;; accepting incoming connections 
-	mov dword [client_addr_len], 16 ;; sizeof(struct sockaddr_in)
+	mov dword [client_addr_len], 16
 	mov rdi, [sockfd] 
 	lea rsi, [client_addr]
 	lea rdx, [client_addr_len]
-	mov rax, 43 ;; accept() syscall
+	mov rax, 43        ; accept() syscall
 	syscall 
 
 	test rax, rax
 	js accept_failed
 
-  mov [client_fd], rax  ; store the new client socket descriptor
+	mov [client_fd], rax
 
-	;; recieve data from the client
-	lea rdi, [buffer]
-	mov rsi, [client_fd]
+	;; print confirmation of client connection
+  mov rdi, 1
+  mov rsi, msg_client_connected
+  call print_string
+
+	; Receive data from client
+	mov rdi, [client_fd]
+	lea rsi, [buffer]
 	mov rdx, 4096
-	mov rax, 45 ;; recv() syscall
+	xor r10, r10       ; flags = 0
+	mov rax, 45        ; recv() syscall
 	syscall
 
 	test rax, rax
-	js recv_failed
+	jle recv_failed    ; Changed to jle to catch both 0 and negative
 
-	;; connecting to the backend server
-  lea rdi, [rcx]          ; Use the backend_host argument passed (backend_host is in rcx)
-  call gethostbyname
+	push rax           ; Save bytes received for later
+	mov rdi, 1
+	mov rsi, msg_data_received
+	call print_string
+	pop rax
+	push rax            ; Save it again
+	mov rdi, rax
+	call print_number
+	mov rdi, 1
+	mov rsi, newline
+	call print_string
 
-  test rax, rax
-  js backend_connect_failed
+	; Parse backend IP (127.0.0.1)
+	mov rdi, r10        ; backend_host from stored pointer
+	call parse_ip
+	test rax, rax
+	js backend_connect_failed
 
-	xor rax, rax
-  mov [backend_fd], rax  ; store the backend socket descriptor
-  mov word [backend_addr], 2 ; sin_family = AF_INET
-  mov dword [backend_addr+4], eax ; backend IP (this will come from gethostbyname)
+	; Create backend socket
+	mov rdi, AF_INET
+	mov rsi, SOCK_STREAM
+	xor rdx, rdx
+	mov rax, 41
+	syscall
 
-  jmp server_loop       ; forever running
+	test rax, rax
+	js backend_connect_failed
 
+	mov [backend_fd], rax
+
+	; Setup backend address
+	mov word [backend_addr], AF_INET
+	mov rdi, r9         ; backend_port
+	call htons
+	mov [backend_addr+2], ax
+	mov eax, [ip_addr]
+	mov [backend_addr+4], eax
+
+	; Connect to backend
+	mov rdi, [backend_fd]
+	lea rsi, [backend_addr]
+	mov edx, 16
+	mov rax, 42
+	syscall
+
+	test rax, rax
+	js backend_connect_failed_cleanup
+
+	; Send data to backend
+	pop rdx             ; Restore received bytes
+	mov rdi, [backend_fd]
+	lea rsi, [buffer]
+	xor r10, r10        ; flags = 0
+	mov rax, 44         ; send syscall
+	syscall
+
+	jmp relay_loop
+
+relay_loop:
+    mov rdi, [backend_fd]   ; Backend socket
+    lea rsi, [buffer]       ; Receive into buffer
+    mov rdx, 4096           ; Buffer size
+		xor r10, r10            ; Flags
+    mov rax, 45             ; recv() syscall
+    syscall
+
+    test rax, rax
+    jle close_connections   ; If <= 0, close sockets
+
+    mov rdx, rax        ; bytes to send
+    mov rdi, [client_fd]
+    lea rsi, [buffer]
+    xor r10, r10
+    mov rax, 44
+    syscall
+
+    jmp relay_loop
+
+close_connections:
+    mov rdi, [backend_fd]
+    mov rax, 3
+    syscall
+    mov rdi, [client_fd]
+    mov rax, 3
+    syscall
+    jmp server_loop
 
 ;; socket failed
 socket_failed:
@@ -185,15 +262,25 @@ socket_failed:
     call print_string
     jmp exit_error
 
-recv_failed:
-		mov rdi, 1
-		mov rsi, msg_failed_recv
-		call print_string
-		jmp exit_error
+backend_connect_failed_cleanup:
+    mov rdi, [backend_fd]
+    mov rax, 3          ; close() syscall
+    syscall
+    mov rdi, [client_fd]
+    mov rax, 3
+    syscall
+    jmp server_loop
+
 
 backend_connect_failed:
 		mov rdi, 1
 		mov rsi, msg_backend_connect_failed
+		call print_string
+		jmp exit_error
+
+recv_failed:
+		mov rdi, 1
+		mov rsi, msg_failed_recv
 		call print_string
 		jmp exit_error
 
@@ -310,78 +397,63 @@ htons:
     xchg al, ah       ; Swap the lower and upper bytes
     ret
 
-gethostbyname:
+
+parse_ip:
     push rbp
     mov rbp, rsp
-    push rbx
     push r12
     push r13
     push r14
-    
-    mov r12, rdi                ; Save input string
-    xor r13, r13                ; Current number
-    xor r14, r14                ; Byte count
-    
-.parse_ip:
+
+    mov r12, rdi        ; Save input string
+    xor r13, r13        ; Current octet
+    xor r14, r14        ; Octet counter
+
+parse_ip_loop:
     movzx rax, byte [r12]
     test al, al
-    jz .finish_byte
-    
+    jz parse_ip_end
+
     cmp al, '.'
-    je .finish_byte
-    
+    je finish_octet
+
     sub al, '0'
     cmp al, 9
-    ja .invalid
-    
+    ja parse_ip_invalid
+
     imul r13, r13, 10
+    movzx rax, al
     add r13, rax
-    
+
     cmp r13, 255
-    ja .invalid
-    
+    ja parse_ip_invalid
+
     inc r12
-    jmp .parse_ip
-    
-.finish_byte:
+    jmp parse_ip_loop
+
+finish_octet:
     mov [ip_addr + r14], r13b
     inc r14
-    
-    cmp r14, 4
-    je .build_hostent
-    
-    test al, al
-    jz .invalid
-    
-    inc r12
     xor r13, r13
-    jmp .parse_ip
-    
-.build_hostent:
-    lea rax, [hostent_struct]
-    
-    mov dword [rax], 0
-    mov qword [rax + 8], 0
-    mov dword [rax + 16], AF_INET
-    mov dword [rax + 20], IP_ADDR_LEN
-    
-    lea rbx, [h_addr_list]
-    mov [rax + 24], rbx
-    
-    mov ebx, [ip_addr]
-    mov [h_addr_list], rbx
-    mov qword [h_addr_list + 8], 0
-    
-    jmp .done
-    
-.invalid:
-    xor rax, rax
-    
-.done:
+    inc r12
+    jmp parse_ip_loop
+
+parse_ip_end:
+    mov [ip_addr + r14], r13b
+    inc r14
+    cmp r14, 4
+    jne parse_ip_invalid
+
+    mov eax, [ip_addr]
+    jmp parse_ip_done
+
+parse_ip_invalid:
+    mov rax, -1
+
+parse_ip_done:
     pop r14
     pop r13
     pop r12
-    pop rbx
     mov rsp, rbp
     pop rbp
     ret
