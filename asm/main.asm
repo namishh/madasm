@@ -448,6 +448,38 @@ atoi_loop:
 atoi_done:
 	ret
 
+
+;; ATOI 
+atoi: 
+	;; this is used to efficiently reset rax to 0 as using XOR with itself always returns 0
+	;; mov rax, 0 is 7 bytes, while xor rax,rax is 2 bytes
+	;; this is faster as well
+	xor rax,rax
+	movzx rcx, byte [rdi]  ; Load first character
+	test  rcx, rcx
+	je    atoi_done     ; If empty string, return 0
+
+
+atoi_loop:
+	movzx rcx, byte [rdi] ;; loading next byte into rcx and zero extend 
+	test  rcx, rcx ;; if rcx is 0 (null terminator), we are done
+	je atoi_done
+
+	cmp   rcx, '0'
+	jl atoi_done ;; if char is less than '0', we are done
+	cmp   rcx, '9'
+	jg atoi_done ;; if char is greater than '9', we are done
+
+	sub   rcx, '0'     ; now rcx holds the numeric value (0-9)
+  ; multiply the current result by 10 and add the new digit:
+  imul  rax, rax, 10
+  add   rax, rcx
+  inc   rdi          ; move pointer to next character
+  jmp   atoi_loop
+
+atoi_done:
+	ret
+
 ;; printing helper functions
 print_string:
     mov rdx, -1
@@ -506,63 +538,50 @@ htons:
     xchg al, ah       ; Swap the lower and upper bytes
     ret
 
-
 parse_ip:
-    push rbp
-    mov rbp, rsp
     push r12
     push r13
-    push r14
+    xor r12, r12        ; Current octet value
+    xor r13, r13        ; Octet counter
+    mov r11, rdi        ; Input string pointer
 
-    mov r12, rdi        ; Save input string
-    xor r13, r13        ; Current octet
-    xor r14, r14        ; Octet counter
-
-parse_ip_loop:
-    movzx rax, byte [r12]
+.parse_ip_loop:
+    movzx rax, byte [r11]
     test al, al
-    jz parse_ip_end
+    jz .parse_ip_end
 
     cmp al, '.'
-    je finish_octet
+    je .store_octet
 
     sub al, '0'
     cmp al, 9
-    ja parse_ip_invalid
+    ja .parse_ip_error
 
-    imul r13, r13, 10
-    movzx rax, al
-    add r13, rax
+    imul r12, r12, 10
+    add r12, rax
+    inc r11
+    jmp .parse_ip_loop
 
-    cmp r13, 255
-    ja parse_ip_invalid
+.store_octet:
+    cmp r13, 3
+    jae .parse_ip_error
+    mov [ip_addr + r13], r12b
+    inc r13
+    xor r12, r12
+    inc r11
+    jmp .parse_ip_loop
 
-    inc r12
-    jmp parse_ip_loop
-
-finish_octet:
-    mov [ip_addr + r14], r13b
-    inc r14
-    xor r13, r13
-    inc r12
-    jmp parse_ip_loop
-
-parse_ip_end:
-    mov [ip_addr + r14], r13b
-    inc r14
-    cmp r14, 4
-    jne parse_ip_invalid
-
+.parse_ip_end:
+    cmp r13, 3
+    jne .parse_ip_error
+    mov [ip_addr + r13], r12b
     mov eax, [ip_addr]
-    jmp parse_ip_done
+    jmp .parse_ip_done
 
-parse_ip_invalid:
+.parse_ip_error:
     mov rax, -1
 
-parse_ip_done:
-    pop r14
+.parse_ip_done:
     pop r13
     pop r12
-    mov rsp, rbp
-    pop rbp
     ret
