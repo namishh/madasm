@@ -10,6 +10,7 @@ section .data
 		msg_failed_bind db "failed to bind socket", 10
 		msg_failed_listen db "failed to listen", 10
 		msg_server_started db "reverse proxy listening on port ", 0
+		msg_send_failed db "failed to send data", 10
 
 		msg_failed_accept db "failed to accept connection", 10
 		msg_failed_recv db "failed to receive data", 10
@@ -18,6 +19,12 @@ section .data
     msg_client_connected db "Client connected", 10
     msg_data_received db "Received data from client. Bytes: ", 0
 		msg_client_disconnected db "Client disconnected", 10
+
+    msg_sending_to_backend db "Sending to backend. Bytes: ", 0
+    msg_backend_sent db "Data sent to backend successfully", 10
+    msg_backend_received db "Received from backend. Bytes: ", 0
+    msg_relay_start db "Starting relay loop", 10
+    msg_buffer_content db "Buffer content: ", 0
 
 		;; utils
 		newline db 10, 0
@@ -234,24 +241,103 @@ server_loop:
 	jmp relay_loop
 
 relay_loop:
-    mov rdi, [backend_fd]   ; Backend socket
-    lea rsi, [buffer]       ; Receive into buffer
-    mov rdx, 4096           ; Buffer size
-		xor r10, r10            ; Flags
-    mov rax, 45             ; recv() syscall
+    ; Debug - Starting relay
+    mov rdi, 1
+    mov rsi, msg_relay_start
+    call print_string
+
+    ; Receive data from client
+    mov rdi, [client_fd]
+    lea rsi, [buffer]
+    mov rdx, 4096
+    xor r10, r10
+    mov rax, 45         ; recv() syscall
     syscall
 
     test rax, rax
-    jle close_connections   ; If <= 0, close sockets
+    jle close_connections
 
-    mov rdx, rax        ; bytes to send
-    mov rdi, [client_fd]
+    ; Debug - Print received bytes
+    push rax            ; Save bytes received
+    mov rdi, 1
+    mov rsi, msg_data_received
+    call print_string
+    pop rax
+    push rax            ; Save it again
+    mov rdi, rax
+    call print_number
+    mov rdi, 1
+    mov rsi, newline
+    call print_string
+
+    ; Debug - Print buffer content
+    mov rdi, 1
+    mov rsi, msg_buffer_content
+    call print_string
+    mov rdi, 1
+    mov rsi, buffer
+    pop rdx             ; Get length
+    push rdx            ; Save it again
+    mov rax, 1          ; sys_write
+    syscall
+    mov rdi, 1
+    mov rsi, newline
+    call print_string
+
+    ; Send data to backend
+    pop rdx             ; Restore bytes to send
+    mov rdi, [backend_fd]
     lea rsi, [buffer]
     xor r10, r10
-    mov rax, 44
+    mov rax, 44         ; send() syscall
     syscall
 
+    test rax, rax
+    js send_failed
+
+    ; Debug - Confirm data sent
+    mov rdi, 1
+    mov rsi, msg_backend_sent
+    call print_string
+
+    ; Wait for backend response with timeout
+    mov rdi, [backend_fd]
+    lea rsi, [backend_buffer]
+    mov rdx, 4096
+    xor r10, r10
+    mov rax, 45         ; recv() syscall
+    syscall
+
+    test rax, rax
+    jle close_connections
+
+    ; Debug - Print received bytes from backend
+    push rax
+    mov rdi, 1
+    mov rsi, msg_backend_received
+    call print_string
+    pop rax
+    push rax
+    mov rdi, rax
+    call print_number
+    mov rdi, 1
+    mov rsi, newline
+    call print_string
+
+    ; Send backend response to client
+    pop rdx
+    mov rdi, [client_fd]
+    lea rsi, [backend_buffer]
+    xor r10, r10
+    mov rax, 44         ; send() syscall
+    syscall
+
+    test rax, rax
+    js send_failed
+
     jmp relay_loop
+
+
 
 client_closed:
     ; Log closure if desired
@@ -290,6 +376,11 @@ backend_connect_failed_cleanup:
     syscall
     jmp server_loop
 
+send_failed:
+		mov rdi, 1
+		mov rsi, msg_send_failed
+		call print_string
+		jmp exit_error
 
 backend_connect_failed:
 		mov rdi, 1
@@ -373,40 +464,39 @@ find_len:
 print_number:
     push rbp
     mov rbp, rsp
-    sub rsp, 32         ; Allocate stack space for local variables
-    
-    mov rax, rdi        ; Number to print is in rdi
-    mov rbx, 10         ; Divisor
-    xor rcx, rcx        ; Counter for number of digits
-    
-convert_loop:
-    xor rdx, rdx        ; Clear rdx before division
-    div rbx             ; Divide rax by 10
-    add dl, '0'         ; Convert remainder to ASCII
-    push rdx            ; Save digit
-    inc rcx             ; Increment digit counter
-    test rax, rax       ; Check if quotient is 0
+    sub rsp, 32         ; Allocate 32 bytes for buffer
+
+    mov rax, rdi        ; Number to print
+    lea r8, [rbp - 32] ; Pointer to buffer start
+    mov r9, r8          ; Save start of buffer
+    add r8, 31          ; Start from the end (buffer[31])
+    mov byte [r8], 0    ; Null terminator
+
+    test rax, rax       ; Handle zero case
     jnz convert_loop
-    
-print_digits:
-    test rcx, rcx       ; Check if we have digits to print
-    jz print_done				; Jumps to specified label if the zero flag is set
-    
-    pop rdi             ; Get digit
-    push rcx            ; Save counter
-    
-    mov [rsp-8], rdi    ; Store digit in stack
+    mov byte [r8], '0'
+    dec r8
+    jmp print_buffer
+
+convert_loop:
+    xor rdx, rdx        ; Clear rdx for division
+    mov rbx, 10         ; Divisor
+    div rbx             ; rax = quotient, rdx = remainder
+    add dl, '0'         ; Convert to ASCII
+    dec r8              ; Move buffer pointer back
+    mov [r8], dl        ; Store digit
+    test rax, rax       ; Check if quotient is zero
+    jnz convert_loop
+
+print_buffer:
+    mov rsi, r8         ; Start of the number string
+    mov rdx, r9         ; Calculate length: end - start +1
+    add rdx, 31         ; End of buffer (rbp -1)
+    sub rdx, r8         ; rdx = length
     mov rdi, 1          ; stdout
-    lea rsi, [rsp-8]    ; Address of digit
-    mov rdx, 1          ; Length
     mov rax, 1          ; sys_write
     syscall
-    
-    pop rcx             ; Restore counter
-    dec rcx             ; Decrement counter
-    jmp print_digits
-    
-print_done:
+
     mov rsp, rbp
     pop rbp
     ret
